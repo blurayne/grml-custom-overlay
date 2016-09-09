@@ -1,0 +1,295 @@
+#!/bin/bash
+# vim: set ts=4 sw=2 tw=0 noet
+
+set -e
+set -u
+
+# set -x # debug
+
+##
+# Variables
+
+SELF=$( basename $0 )
+CONFIGFILE=".grml-custom"
+LOCKFILE="/var/run/$SELF.pid"
+TMP="mnt"
+VERSION="0.0.1"
+RUNONCE="" # collect functions to run once
+WORKDIR="${PWD}"
+
+##
+# Register shutdown
+
+cleanup() {
+    for job in $( jobs -p )
+    do
+       kill -9 $job
+    done
+}
+
+trap cleanup EXIT
+trap cleanup TERM
+
+##
+# Helper Functions
+
+initchecks() {
+
+    if ! [ -x "$(command -v grml2iso)" ]; then
+      echo 'grml2iso: not installed but required (try apt-get install grml2usb)' >&2
+      exit -1
+    fi
+
+    if ! [ -x "$(command -v wget)" ]; then
+      echo 'wget: not installed but required (try apt-get install wget)' >&2
+      exit -1
+    fi
+
+    if ! [ -x "$(command -v chroot)" ]; then
+      echo 'chroot: not installed but required (try apt-get install debootstrap)' >&2
+      exit -1
+    fi
+
+    if [ ! "$( cat /proc/filesystems | grep aufs )" ]; then
+      echo 'aufs: filesystem not supported (update to a newer kernel or try apt-get install aufstools)' >&2
+      exit -1
+    fi
+}
+
+runonce() {
+  [ "$( echo $RUNONCE | grep $1 )" ] && return 1
+  RUNONCE="$RUNONCE $1"
+  return 0
+}
+
+root_check() {
+  runonce $FUNCNAME ||  return 0
+
+  echo -n "Checking root…"
+  if ! [ $(id -u) = 0 ]; then
+      echo "you need to be root! aborting."
+      exit 1
+  fi
+  echo done.
+}
+
+
+config_read() {
+  runonce $FUNCNAME || return 0
+
+  if [ ! -e "$CONFIGFILE" ]; then
+    >&2 echo "Config file $CONFIGFILE is missing!"
+    exit 1
+  fi;
+  echo -n "Reading config…"
+  . ./$CONFIGFILE
+  echo done
+}
+
+##
+# Main Functions
+
+
+create_custom_grml_sh() {
+
+  cat << 'EOF' >> custom/scripts/custom.sh
+#!/bin/bash
+
+echo "Welcome to your custom grml!"
+
+HASOVERLAYFS=$( mount | grep "overlay on" | echo 1 )
+
+ # New GRML
+if [ $HASOVERLAYFS ]; then
+  mkdir -p /grml-custom/work
+  mkdir /grml-custom/overlay
+  mount -t overlay -o lowerdir=/:/lib/live/mount/medium/overlay,workdir=/grml-custom/work overlay /grml-custom/overlay
+
+  # Since overlayfs doesn't allow remounting root path we do it for each directory
+  echo Binding custom overlay…
+  for P in $( cd /lib/live/mount/medium/overlay; find . -maxdepth 1 -type d -not -name ".*" | tr -d './'); do
+    echo $P
+    mount --bind /custom/overlay/$P /$P
+    [ ! -d /$P ] && mkdir -p /$P
+    echo $i;
+  done;
+  echo done.
+
+  # Old grml
+else
+
+   sudo mount -t aufs -o remount,rw,dirs=/lib/live/mount/medium/custom=ro unionfs /
+
+fi;
+
+grml-quickconfig
+EOF
+
+}
+
+init_project() {
+
+  root_check
+
+  # Init project layout, download iso and create config file
+
+  echo "This will (re)initialize your custom-grml project."
+  echo "(Note: netbook packages are yet not supported)"
+
+  # Create layout
+  mkdir -p import
+  mkdir -p iso
+  mkdir -p custom/scripts
+  mkdir -p custom/overlay
+  [ ! -e custom/scripts/custom.sh ] && create_custom_grml_sh
+  chown root:root -R custom/scripts
+  chmod 0755 -R custom/scripts/custom.sh
+
+  mkdir -p custom/overlayecho $
+  mkdir -p import
+
+  PS3='Please choose a distribution: '
+  options=("small" "full")
+  select opt in "${options[@]}"; do ISO_VERSION=$opt; break; done;
+
+  PS3='Please choose an architecture: '
+  options=("32" "64" "96 (32+64bit)")
+  select opt in "${options[@]}"; do ISO_ARCH=$( echo $opt | cut -d' ' -f1 ); break; done;
+
+  PS3='Please choose a branch: '
+  options=("2014.11 (stable)" "testing (latest xenial)")
+  select opt in "${options[@]}"; do ISO_BRANCH=$( echo $opt | cut -d' ' -f1 ); break;  done;
+
+  ISO_URL="http://download.grml.org/grml${ISO_ARCH}-${ISO_VERSION}_${ISO_BRANCH}.iso"
+  mkdir -p $( dirname $ISO_URL )
+  ISO_FILENAME=iso/$( basename $ISO_URL )
+
+
+
+
+  [ ! -e $CONFIGFILE ] && touch $CONFIGFILE
+  truncate -s 0 $CONFIGFILE
+  echo ISO_URL=$ISO_URL > $CONFIGFILE
+  echo ISO_FILENAME=$ISO_FILENAME >> $CONFIGFILE
+
+  # Delete
+  if [ -e $ISO_FILENAME ]; then
+     echo -n "The image ${ISO_FILENAME} already exists. Delete and re-download (y/n)? "
+     read ANSWER
+     if [ "$ANSWER" == "y" ]; then
+       rm $ISO_FILENAME
+     fi;
+  fi;
+
+  [ ! -e $ISO_FILENAME ] && wget -O $ISO_FILENAME $ISO_URL
+
+  echo
+  echo "Everything done and you ready to chroot and create your custom grml."
+  echo
+  echo "Please files to import into chroot to ./import-folder, access inside chroot using /import!"
+
+}
+
+grml_chroot() {
+  root_check
+  config_read
+  grml_mount
+
+  echo "Chrooting to $TMP/custom-overlay…"
+  chroot $TMP/custom-overlay /bin/bash
+  grml_umount
+}
+
+grml_mount() {
+  root_check
+  config_read
+
+  mkdir -p $TMP
+  mkdir -p $TMP/custom-diff
+  mkdir -p import
+  mkdir -p $TMP/custom-overlay
+  mkdir -p $TMP/iso
+  mkdir -p $TMP/grml-rootfs
+
+  [ ! "$( mount | grep $ISO_FILENAME | grep $TMP/iso )" ] && mount -o loop,ro $ISO_FILENAME $TMP/iso
+  SQUASHIMAGE=$( find $TMP/iso/live -name *.squashfs )
+  [ ! "$( mount | grep $SQUASHIMAGE | grep $TMP/grml-rootfs )" ] && mount -t squashfs $SQUASHIMAGE $TMP/grml-rootfs
+  [ ! "$( mount | grep $TMP/custom-overlay )" ] && mount -t aufs -o dirs=$TMP/custom-diff=rw:$TMP/grml-rootfs=ro unionfs $TMP/custom-overlay
+  mount --bind /sys $TMP/custom-overlay/sys
+  mount --bind /proc $TMP/custom-overlay/proc
+  mkdir -p $TMP/custom-overlay/import
+  mount --bind import $TMP/custom-overlay/import
+}
+
+grml_umount() {
+  root_check
+
+  MOUNTPOINTS="
+    $TMP/custom-overlay/import
+    $TMP/custom-overlay/proc
+    $TMP/custom-overlay/sys
+    $TMP/custom-overlay
+    $TMP/grml-rootfs
+    $TMP/iso
+  "
+  MOUNTPOINTS="$(echo -e "${MOUNTPOINTS}" | tr -d '\n\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  for MOUNTPOINT in $MOUNTPOINTS; do
+    IS_MOUNTED=$( mount | grep "on ${MOUNTPOINT} type" )
+    [ "$IS_MOUNTED" ] && umount $MOUNTPOINT
+  done;
+  for MOUNTPOINT in $MOUNTPOINTS; do
+    IS_MOUNTED=$( mount | grep "on ${MOUNTPOINT} type" )
+    [ "$IS_MOUNTED" ] && umount $MOUNTPOINT
+  done;
+
+  for MOUNTPOINT in "$(mount | grep $PWD | cut -d' ' -f3)"; do
+    umount $MOUNTPOINT
+  done;
+  for MOUNTPOINT in "$(mount | grep $PWD | cut -d' ' -f3)"; do
+    umount -l $MOUNTPOINT
+  done;
+}
+
+grml_create_config() {
+  tar -C diff --numeric-owner -j -cv -f  overlay/config.tbz .
+}
+
+create_iso() {
+  root_check
+  config_read
+
+  rsync -avz -R $TMP/custom-diff/* custom/overlay/
+  rm -fr custom/overlay/grml-custom-import
+  rm -fr custom/overlay/tmp
+
+  # use no framebuffer nofb
+  # start lvm
+  # configure for german keyboard
+  grml2iso -f -b "nofb lang=de gmt lvm startup=/lib/live/mount/medium/scripts/grml-custom.sh" -c custom -o grml-custom.iso $ISO_FILENAME
+}
+
+main() {
+  case $1 in
+    init) init_project ;;
+    chroot) grml_chroot ;;
+    iso) create_iso ;;
+    mount) grml_mount ;;
+    umount) grml_umount ;;
+    *)
+      echo "Create custom grml image by using iso image as base"
+      echo "Usage  : $SELF (init|chroot|iso)  (version: $VERSION)"
+      echo
+      echo   init  : init new custom grml project
+      echo   chroot: chroot to your project
+      echo   iso   : create custom iso image with diff
+      echo   mount : mount for chroot
+      echo   umount: umount
+      echo
+      ;;
+  esac
+    exit 0
+}
+
+main $1
+exit
+$PWD
