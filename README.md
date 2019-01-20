@@ -1,6 +1,8 @@
 # grml-custom
 
-**Current status:** expirimental  – *takecare before using!*
+**Current status:** expirimental  – *take care before using!
+
+NOTE: This project was deprecated in favor for https://gitlab.com/blurayne/grml-iso-remaster
 
 ## Abstract
 
